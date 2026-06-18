@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Basic Robot Controller</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .control-btn { 
+            transition: transform 0.1s, background-color 0.15s, box-shadow 0.15s; 
+            touch-action: manipulation; 
+            -webkit-user-select: none; 
+            user-select: none; 
+        }
+        .control-btn:active { 
+            transform: scale(0.92); 
+            background-color: #3b82f6; 
+            box-shadow: 0 0 20px rgba(59, 130, 246, 0.5); 
+        }
+    </style>
+</head>
+<body class="bg-slate-900 text-white min-h-screen flex flex-col font-sans select-none">
+
+    <!-- Header -->
+    <header class="p-4 bg-slate-800 shadow-lg flex justify-between items-center border-b border-slate-700">
+        <div>
+            <h1 class="text-xl sm:text-2xl font-bold tracking-tight text-white">
+                Basic Drive <span class="text-blue-400">RC</span>
+            </h1>
+            <p id="statusText" class="text-xs text-red-400 font-bold uppercase tracking-wider mt-1">Disconnected</p>
+        </div>
+        <button id="connectBtn" class="bg-blue-600 px-6 py-3 rounded-full font-semibold hover:bg-blue-500 transition-all shadow-lg active:scale-95">
+            Connect
+        </button>
+    </header>
+
+    <!-- Main Drive Interface -->
+    <main class="flex-grow flex flex-col items-center justify-center p-6 w-full max-w-md mx-auto">
+        
+        <!-- D-Pad -->
+        <div class="grid grid-cols-3 gap-3 sm:gap-4 w-full aspect-square max-w-[320px]">
+            <div></div>
+            <button id="btnForward" class="control-btn bg-slate-800 border-2 border-slate-600 rounded-2xl flex items-center justify-center text-4xl shadow-lg hover:border-blue-500">▲</button>
+            <div></div>
+            
+            <button id="btnLeft" class="control-btn bg-slate-800 border-2 border-slate-600 rounded-2xl flex items-center justify-center text-4xl shadow-lg hover:border-blue-500">◀</button>
+            <button id="btnStop" class="control-btn bg-red-900/50 border-2 border-red-700 rounded-2xl flex items-center justify-center text-xl font-bold shadow-lg hover:bg-red-800">STOP</button>
+            <button id="btnRight" class="control-btn bg-slate-800 border-2 border-slate-600 rounded-2xl flex items-center justify-center text-4xl shadow-lg hover:border-blue-500">▶</button>
+            
+            <div></div>
+            <button id="btnBackward" class="control-btn bg-slate-800 border-2 border-slate-600 rounded-2xl flex items-center justify-center text-4xl shadow-lg hover:border-blue-500">▼</button>
+            <div></div>
+        </div>
+        
+        <p class="text-slate-500 text-xs mt-12 text-center">You can also use WASD or Arrow Keys on a keyboard.</p>
+
+    </main>
+
+    <script>
+        const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+        const CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+        
+        let device, characteristic;
+        let currentLDir = 0, currentRDir = 0;
+        let isMoving = false;
+        let commandInterval = null;
+        let isWriting = false; 
+        let pendingCommand = null; 
+        
+        const elements = {
+            connectBtn: document.getElementById('connectBtn'),
+            statusText: document.getElementById('statusText'),
+            btnForward: document.getElementById('btnForward'),
+            btnBackward: document.getElementById('btnBackward'),
+            btnLeft: document.getElementById('btnLeft'),
+            btnRight: document.getElementById('btnRight'),
+            btnStop: document.getElementById('btnStop')
+        };
+
+        // ═══════════════════════════════════════════════════════════════════
+        // BLUETOOTH CONNECTION
+        // ═══════════════════════════════════════════════════════════════════
+        
+        elements.connectBtn.addEventListener('click', async () => {
+            if (device?.gatt?.connected) {
+                device.gatt.disconnect();
+                return;
+            }
+            
+            try {
+                elements.statusText.textContent = "SEARCHING...";
+                elements.statusText.className = "text-xs text-yellow-400 font-bold uppercase tracking-wider mt-1";
+                
+                device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+                device.addEventListener('gattserverdisconnected', onDisconnected);
+                
+                elements.statusText.textContent = "CONNECTING...";
+                const server = await device.gatt.connect();
+                const service = await server.getPrimaryService(SERVICE_UUID);
+                characteristic = await service.getCharacteristic(CHAR_UUID);
+                
+                // We still start notifications to keep the ESP32 buffer happy, but we just ignore the data.
+                await characteristic.startNotifications();
+                
+                onConnected();
+            } catch (err) {
+                onDisconnected();
+                console.error(err);
+            }
+        });
+        
+        function onConnected() {
+            elements.connectBtn.textContent = "Disconnect";
+            elements.connectBtn.classList.replace('bg-blue-600', 'bg-red-600');
+            elements.statusText.textContent = "CONNECTED & ACTIVE";
+            elements.statusText.className = "text-xs text-emerald-400 font-bold uppercase tracking-wider mt-1";
+            
+            // Background heartbeat to keep connection alive
+            setInterval(() => { if (!isMoving && characteristic) sendCommand(); }, 500);
+        }
+        
+        function onDisconnected() {
+            characteristic = null;
+            stopMoving();
+            elements.connectBtn.textContent = "Connect";
+            elements.connectBtn.classList.replace('bg-red-600', 'bg-blue-600');
+            elements.statusText.textContent = "DISCONNECTED";
+            elements.statusText.className = "text-xs text-red-400 font-bold uppercase tracking-wider mt-1";
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // DRIVING LOGIC
+        // ═══════════════════════════════════════════════════════════════════
+        
+        async function sendCommand() {
+            if (!characteristic || !device?.gatt?.connected) return;
+            
+            const lSign = currentLDir > 0 ? 1 : (currentLDir < 0 ? -1 : 0);
+            const rSign = currentRDir > 0 ? 1 : (currentRDir < 0 ? -1 : 0);
+            
+            // Single speed mode: 255 if moving, 0 if stopped
+            const speed = (lSign === 0 && rSign === 0) ? 0 : 255;
+            
+            // FORMAT: LeftDir, RightDir, Speed, LCorr, RCorr, ServoAngle, PWMFreq
+            // We hardcode the calibration, servo, and PWM so the firmware stays happy!
+            const cmd = `${lSign},${rSign},${speed},1.00,1.00,90,20000`;
+            
+            if (isWriting) { 
+                pendingCommand = cmd; 
+                return; 
+            }
+            
+            isWriting = true;
+            try {
+                await characteristic.writeValue(new TextEncoder().encode(cmd));
+            } catch (err) { 
+                console.warn(err);
+            } finally {
+                isWriting = false;
+                if (pendingCommand) {
+                    pendingCommand = null;
+                    setTimeout(() => sendCommand(), 10);
+                }
+            }
+        }
+        
+        function startMoving(lDir, rDir) {
+            currentLDir = lDir; 
+            currentRDir = rDir;
+            if (!isMoving) {
+                isMoving = true;
+                if (commandInterval) clearInterval(commandInterval);
+                sendCommand(); 
+                commandInterval = setInterval(() => { if (isMoving) sendCommand(); }, 100);
+            }
+        }
+        
+        function stopMoving() {
+            currentLDir = 0; 
+            currentRDir = 0; 
+            isMoving = false;
+            if (commandInterval) { clearInterval(commandInterval); commandInterval = null; }
+            sendCommand(); 
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // INPUT HANDLERS
+        // ═══════════════════════════════════════════════════════════════════
+        
+        // Touch & Click Listeners for D-Pad
+        function bindButton(btn, l, r) {
+            btn.addEventListener('mousedown', () => startMoving(l, r));
+            btn.addEventListener('mouseup', stopMoving);
+            btn.addEventListener('mouseleave', stopMoving);
+            btn.addEventListener('touchstart', (e) => { e.preventDefault(); startMoving(l, r); });
+            btn.addEventListener('touchend', (e) => { e.preventDefault(); stopMoving(); });
+        }
+        
+        bindButton(elements.btnForward, 1, 1);
+        bindButton(elements.btnBackward, -1, -1);
+        bindButton(elements.btnLeft, -1, 1);
+        bindButton(elements.btnRight, 1, -1);
+        elements.btnStop.addEventListener('click', stopMoving);
+        elements.btnStop.addEventListener('touchstart', (e) => { e.preventDefault(); stopMoving(); });
+
+        // Keyboard Listeners
+        const keyMap = { 
+            'ArrowUp': [1, 1], 'w': [1, 1], 
+            'ArrowDown': [-1, -1], 's': [-1, -1], 
+            'ArrowLeft': [-1, 1], 'a': [-1, 1], 
+            'ArrowRight': [1, -1], 'd': [1, -1], 
+            ' ': [0, 0] 
+        };
+        let activeKey = null;
+        
+        document.addEventListener('keydown', (e) => {
+            if (e.repeat || activeKey) return; 
+            const dirs = keyMap[e.key.toLowerCase()] || keyMap[e.key];
+            if (dirs) { 
+                e.preventDefault(); 
+                activeKey = e.key; 
+                if (dirs[0] === 0) stopMoving(); else startMoving(dirs[0], dirs[1]); 
+            }
+        });
+        
+        document.addEventListener('keyup', (e) => {
+            if (e.key === activeKey || e.key.toLowerCase() === activeKey) { 
+                activeKey = null; 
+                stopMoving(); 
+            }
+        });
+
+    </script>
+</body>
+</html>
